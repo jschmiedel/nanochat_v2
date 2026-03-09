@@ -37,6 +37,10 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Recurrent knowledge state (0 = disabled for backward compatibility)
+    state_dim: int = 0              # GRU hidden state dimension (e.g. n_embd // 4)
+    chunk_size: int = 128           # tokens per chunk for chunked KV-cache training
+    detach_knowledge_state: bool = True  # truncated BPTT: detach k between chunks
 
 
 def norm(x):
@@ -149,6 +153,41 @@ class Block(nn.Module):
         return x
 
 
+class KnowledgeGRU(nn.Module):
+    """Recurrent knowledge state via GRU. Scans over hidden states to produce a summary state."""
+    def __init__(self, n_embd, state_dim):
+        super().__init__()
+        self.gru_cell = nn.GRUCell(n_embd, state_dim)
+        self.k_init = nn.Parameter(torch.zeros(state_dim))  # learnable initial state
+
+    def forward(self, h_seq, k_prev):
+        """
+        h_seq: (B, C, n_embd) - hidden states from one chunk
+        k_prev: (B, state_dim) - knowledge state entering this chunk
+        Returns: k_final (B, state_dim) after scanning all C positions
+        """
+        k = k_prev
+        for t in range(h_seq.size(1)):
+            k = self.gru_cell(h_seq[:, t].float(), k.float()).to(h_seq.dtype)
+        return k
+
+
+class InputCombiner(nn.Module):
+    """Combines token embedding with knowledge state via concat + projection."""
+    def __init__(self, n_embd, state_dim):
+        super().__init__()
+        self.proj = Linear(n_embd + state_dim, n_embd, bias=False)
+
+    def forward(self, emb, k):
+        """
+        emb: (B, T, n_embd) - token embeddings
+        k: (B, state_dim) - knowledge state (same for all T positions in chunk)
+        Returns: (B, T, n_embd)
+        """
+        k_expanded = k.unsqueeze(1).expand(-1, emb.size(1), -1)
+        return self.proj(torch.cat([emb, k_expanded], dim=-1))
+
+
 class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
         """
@@ -181,6 +220,13 @@ class GPT(nn.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        # Recurrent knowledge state (disabled when state_dim == 0)
+        if config.state_dim > 0:
+            self.knowledge_gru = KnowledgeGRU(config.n_embd, config.state_dim)
+            self.input_combiner = InputCombiner(config.n_embd, config.state_dim)
+        else:
+            self.knowledge_gru = None
+            self.input_combiner = None
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -234,6 +280,15 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
+
+        # Knowledge state modules
+        if self.knowledge_gru is not None:
+            self.knowledge_gru.k_init.zero_()
+            self.knowledge_gru.gru_cell.reset_parameters()
+            # InputCombiner: identity for emb portion, zeros for state portion → neutral at init
+            torch.nn.init.zeros_(self.input_combiner.proj.weight)
+            n = self.config.n_embd
+            self.input_combiner.proj.weight[:n, :n] = torch.eye(n, dtype=self.input_combiner.proj.weight.dtype)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -310,10 +365,15 @@ class GPT(nn.Module):
         - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
         """
         nparams = sum(p.numel() for p in self.parameters())
-        # Exclude non-matmul params: embeddings and per-layer scalars
+        # Exclude non-matmul params: embeddings, per-layer scalars, GRU biases and k_init
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel())
+        if self.knowledge_gru is not None:
+            # Exclude GRU biases and k_init (non-matmul params); GRU weights and InputCombiner are matmuls
+            nparams_exclude += (self.knowledge_gru.k_init.numel() +
+                               self.knowledge_gru.gru_cell.bias_ih.numel() +
+                               self.knowledge_gru.gru_cell.bias_hh.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -342,7 +402,11 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        knowledge_state_params = 0
+        if self.knowledge_gru is not None:
+            knowledge_state_params = (sum(p.numel() for p in self.knowledge_gru.parameters()) +
+                                      sum(p.numel() for p in self.input_combiner.parameters()))
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars + knowledge_state_params
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
@@ -350,6 +414,7 @@ class GPT(nn.Module):
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
             'scalars': scalars,
+            'knowledge_state': knowledge_state_params,
             'total': total,
         }
 
@@ -364,7 +429,19 @@ class GPT(nn.Module):
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        # Knowledge state params (GRU cell goes to AdamW, InputCombiner proj goes to Muon)
+        gru_params = []
+        k_init_params = []
+        combiner_params = []
+        if self.knowledge_gru is not None:
+            gru_params = list(self.knowledge_gru.gru_cell.parameters())  # weights + biases
+            k_init_params = [self.knowledge_gru.k_init]
+            combiner_params = list(self.input_combiner.parameters())  # proj.weight -> Muon
+            matrix_params.extend(combiner_params)  # InputCombiner is a clean matrix
+        expected = (len(matrix_params) + len(embedding_params) + len(lm_head_params) +
+                    len(value_embeds_params) + len(resid_params) + len(x0_params) +
+                    len(gru_params) + len(k_init_params))
+        assert len(list(self.parameters())) == expected, f"Parameter count mismatch: {len(list(self.parameters()))} != {expected}"
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -379,6 +456,11 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
+        # Knowledge state param groups
+        if gru_params:
+            param_groups.append(dict(kind='adamw', params=gru_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
+        if k_init_params:
+            param_groups.append(dict(kind='adamw', params=k_init_params, lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -393,42 +475,141 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
-        B, T = idx.size()
+    def _forward_chunk(self, idx, kv_cache, knowledge_state=None):
+        """
+        Forward pass for a single chunk of tokens. Used by both the chunked training path
+        and the standard inference path when knowledge state is active.
 
-        # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
-        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
-        assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
-        assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
-        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
-        T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+        Args:
+            idx: (B, C) token ids for this chunk
+            kv_cache: KVCache instance (always present when knowledge state is used)
+            knowledge_state: (B, state_dim) or None
 
-        # Forward the trunk of the Transformer
-        x = self.transformer.wte(idx) # embed current token
-        x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
+        Returns: (logits, h_seq) where h_seq is the normed hidden states for GRU input
+        """
+        B, C = idx.size()
+
+        # Rotary embeddings offset by current cache position
+        T0 = kv_cache.get_pos()
+        cos_sin = self.cos[:, T0:T0+C], self.sin[:, T0:T0+C]
+
+        # Token embedding + knowledge state combination (before norm)
+        x = self.transformer.wte(idx)
+        x = x.to(COMPUTE_DTYPE)
+        if self.input_combiner is not None and knowledge_state is not None:
+            x = self.input_combiner(x, knowledge_state)
         x = norm(x)
-        x0 = x  # save initial normalized embedding for x0 residual
+        x0 = x
+
+        # Transformer blocks with KV cache
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
-        x = norm(x)
+        h_seq = norm(x)  # (B, C, n_embd) — hidden states for GRU and lm_head
 
-        # Forward the lm_head (compute logits)
-        softcap = 20 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., :self.config.vocab_size] # slice to remove padding
-        logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
+        # Logits
+        softcap = 20
+        logits = self.lm_head(h_seq)
+        logits = logits[..., :self.config.vocab_size]
+        logits = logits.float()
+        logits = softcap * torch.tanh(logits / softcap)
+
+        return logits, h_seq
+
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean',
+                knowledge_state=None, return_knowledge_state=False):
+        B, T = idx.size()
+
+        # ---- Standard path: no knowledge state ----
+        if self.knowledge_gru is None:
+            assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+            assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
+            assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
+            T0 = 0 if kv_cache is None else kv_cache.get_pos()
+            cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+
+            x = self.transformer.wte(idx)
+            x = x.to(COMPUTE_DTYPE)
+            x = norm(x)
+            x0 = x
+            for i, block in enumerate(self.transformer.h):
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x = norm(x)
+
+            softcap = 20
+            logits = self.lm_head(x)
+            logits = logits[..., :self.config.vocab_size]
+            logits = logits.float()
+            logits = softcap * torch.tanh(logits / softcap)
+
+            if targets is not None:
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+                return loss
+            else:
+                return logits
+
+        # ---- Knowledge state path: chunked training or inference with KV cache ----
+        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+        assert idx.device == self.cos.device
+
+        # Initialize knowledge state
+        if knowledge_state is None:
+            knowledge_state = self.knowledge_gru.k_init.unsqueeze(0).expand(B, -1).to(COMPUTE_DTYPE)
+
+        if kv_cache is not None:
+            # Inference path: single forward through _forward_chunk, update knowledge state
+            logits, h_seq = self._forward_chunk(idx, kv_cache, knowledge_state)
+            knowledge_state = self.knowledge_gru(h_seq, knowledge_state)
+            if return_knowledge_state:
+                return logits, knowledge_state
+            if targets is not None:
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+                return loss
+            return logits
+
+        # Training path: chunked processing with a temporary KV cache
+        from nanochat.engine import KVCache as _KVCache
+        C = self.config.chunk_size
+        assert T % C == 0, f"Sequence length {T} must be divisible by chunk_size {C}"
+        num_chunks = T // C
+
+        head_dim = self.config.n_embd // self.config.n_head
+        train_kv_cache = _KVCache(
+            batch_size=B, num_heads=self.config.n_kv_head, seq_len=T,
+            head_dim=head_dim, num_layers=self.config.n_layer,
+            device=idx.device, dtype=COMPUTE_DTYPE,
+        )
+
+        total_loss = 0.0
+        for c in range(num_chunks):
+            chunk_start = c * C
+            chunk_end = chunk_start + C
+            idx_chunk = idx[:, chunk_start:chunk_end]
+
+            # Optionally detach knowledge state at chunk boundaries (truncated BPTT)
+            k_input = knowledge_state.detach() if self.config.detach_knowledge_state else knowledge_state
+
+            logits, h_seq = self._forward_chunk(idx_chunk, train_kv_cache, k_input)
+
+            # Per-token GRU scan to update knowledge state
+            knowledge_state = self.knowledge_gru(h_seq, k_input)
+
+            # Accumulate loss for this chunk
+            if targets is not None:
+                tgt_chunk = targets[:, chunk_start:chunk_end]
+                chunk_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), tgt_chunk.view(-1), ignore_index=-1, reduction=loss_reduction)
+                total_loss = total_loss + chunk_loss
 
         if targets is not None:
-            # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
+            if return_knowledge_state:
+                return total_loss / num_chunks, knowledge_state
+            return total_loss / num_chunks
         else:
-            # inference: just return the logits directly
+            if return_knowledge_state:
+                return logits, knowledge_state
             return logits
 
     @torch.inference_mode()
@@ -445,19 +626,54 @@ class GPT(nn.Module):
         if temperature > 0:
             rng = torch.Generator(device=device)
             rng.manual_seed(seed)
-        ids = torch.tensor([tokens], dtype=torch.long, device=device) # add batch dim
-        for _ in range(max_tokens):
-            logits = self.forward(ids) # (B, T, vocab_size)
-            logits = logits[:, -1, :] # (B, vocab_size)
-            if top_k is not None and top_k > 0:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            if temperature > 0:
-                logits = logits / temperature
-                probs = F.softmax(logits, dim=-1)
-                next_ids = torch.multinomial(probs, num_samples=1, generator=rng)
-            else:
-                next_ids = torch.argmax(logits, dim=-1, keepdim=True)
-            ids = torch.cat((ids, next_ids), dim=1)
-            token = next_ids.item()
-            yield token
+
+        if self.knowledge_gru is not None:
+            # Knowledge state variant: use KV cache for efficient generation
+            from nanochat.engine import KVCache as _KVCache
+            max_seq = len(tokens) + max_tokens
+            head_dim = self.config.n_embd // self.config.n_head
+            kv_cache = _KVCache(
+                batch_size=1, num_heads=self.config.n_kv_head, seq_len=max_seq,
+                head_dim=head_dim, num_layers=self.config.n_layer,
+                device=device, dtype=COMPUTE_DTYPE,
+            )
+            # Prefill: process prompt tokens
+            ids = torch.tensor([tokens], dtype=torch.long, device=device)
+            logits, knowledge_state = self.forward(ids, kv_cache=kv_cache, return_knowledge_state=True)
+            logits = logits[:, -1, :]
+            for _ in range(max_tokens):
+                if top_k is not None and top_k > 0:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                if temperature > 0:
+                    logits = logits / temperature
+                    probs = F.softmax(logits, dim=-1)
+                    next_ids = torch.multinomial(probs, num_samples=1, generator=rng)
+                else:
+                    next_ids = torch.argmax(logits, dim=-1, keepdim=True)
+                token = next_ids.item()
+                yield token
+                # Decode next token
+                logits, knowledge_state = self.forward(
+                    next_ids, kv_cache=kv_cache, knowledge_state=knowledge_state,
+                    return_knowledge_state=True,
+                )
+                logits = logits[:, -1, :]
+        else:
+            # Standard path: no KV cache (original naive implementation)
+            ids = torch.tensor([tokens], dtype=torch.long, device=device)
+            for _ in range(max_tokens):
+                logits = self.forward(ids)
+                logits = logits[:, -1, :]
+                if top_k is not None and top_k > 0:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                if temperature > 0:
+                    logits = logits / temperature
+                    probs = F.softmax(logits, dim=-1)
+                    next_ids = torch.multinomial(probs, num_samples=1, generator=rng)
+                else:
+                    next_ids = torch.argmax(logits, dim=-1, keepdim=True)
+                ids = torch.cat((ids, next_ids), dim=1)
+                token = next_ids.item()
+                yield token

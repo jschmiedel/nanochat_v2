@@ -26,6 +26,12 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    if "state_dim" not in model_config_kwargs:
+        model_config_kwargs["state_dim"] = 0
+    if "chunk_size" not in model_config_kwargs:
+        model_config_kwargs["chunk_size"] = 128
+    if "detach_knowledge_state" not in model_config_kwargs:
+        model_config_kwargs["detach_knowledge_state"] = True
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""

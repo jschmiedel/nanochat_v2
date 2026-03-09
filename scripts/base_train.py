@@ -52,6 +52,10 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+# Recurrent knowledge state
+parser.add_argument("--state-dim", type=int, default=0, help="knowledge state dimension (0=disabled, e.g. n_embd//4)")
+parser.add_argument("--chunk-size", type=int, default=128, help="chunk size for chunked KV-cache training with knowledge state")
+parser.add_argument("--no-detach-knowledge-state", action="store_true", help="allow gradient flow through knowledge state across chunks (full BPTT)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -139,6 +143,9 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        state_dim=args.state_dim,
+        chunk_size=args.chunk_size,
+        detach_knowledge_state=not args.no_detach_knowledge_state,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

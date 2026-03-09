@@ -201,8 +201,16 @@ class Engine:
             **kv_model_kwargs,
         )
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
-        logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
+        has_knowledge_state = hasattr(self.model, 'knowledge_gru') and self.model.knowledge_gru is not None
+        if has_knowledge_state:
+            logits, knowledge_state = self.model.forward(ids, kv_cache=kv_cache_prefill, return_knowledge_state=True)
+            logits = logits[:, -1, :].expand(num_samples, -1)
+            # Clone knowledge state for each sample
+            knowledge_state = knowledge_state.expand(num_samples, -1).contiguous()
+        else:
+            logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
+            logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
+            knowledge_state = None
 
         # 2) Replicate the KV cache for each sample/row
         kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
@@ -271,7 +279,14 @@ class Engine:
 
             # Prepare logits for next iteration
             ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
-            logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
+            if knowledge_state is not None:
+                logits, knowledge_state = self.model.forward(
+                    ids, kv_cache=kv_cache_decode, knowledge_state=knowledge_state,
+                    return_knowledge_state=True,
+                )
+                logits = logits[:, -1, :]
+            else:
+                logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
 
     def generate_batch(self, tokens, num_samples=1, **kwargs):
         """
